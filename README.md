@@ -127,4 +127,4 @@ location / {
 
 ## 许可
 
-基于 Chester Enright 的原始脚本修改。
+基于 amunchet 的 [noVNCCopyPasteProxmox.user.js](https://gist.github.com/amunchet/4cfaf0274f3d238946f9f8f94fa9ee02) 开发。
