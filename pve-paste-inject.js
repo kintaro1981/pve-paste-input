@@ -1,7 +1,7 @@
 /**
  * PVE 粘贴输入脚本 - Nginx 注入版本
  * 适用于通过反向代理注入到 PVE 页面
- * 版本: 1.0
+ * 版本: 1.1
  */
 
 // ============================================
@@ -595,12 +595,12 @@ const CONFIG = {
             return;
         }
 
-        // 创建按钮
+        // 创建按钮（默认隐藏，等待同步逻辑决定是否显示）
         const pasteButton = $(`
             <input type="image" alt="粘贴输入"
                    src="/novnc/app/images/clipboard.svg"
                    id="noVNC_paste_button"
-                   class="noVNC_button"
+                   class="noVNC_button noVNC_hidden"
                    title="粘贴输入" />
         `);
 
@@ -618,52 +618,86 @@ const CONFIG = {
             }
         }
 
-        // 监听"仅查看"复选框状态
-        function setupViewOnlyListener(pasteButton) {
-            const updateButtonVisibility = (checkbox) => {
-                if (checkbox && checkbox.checked) {
-                    // 仅查看模式：隐藏粘贴按钮
-                    pasteButton.addClass('noVNC_hidden');
-                } else {
-                    // 正常模式：显示粘贴按钮
+        // 同步粘贴按钮与"显示额外按键"按钮的显示状态
+        function syncWithExtraKeysButton(pasteButton) {
+            let lastVisibleState = null;  // 缓存上次的可见状态，避免重复更新
+            let intersectionObserver = null;  // IntersectionObserver 实例
+
+            // 更新按钮可见性（带状态缓存）
+            const updateButtonVisibility = (isVisible) => {
+                // 状态未改变，跳过更新
+                if (lastVisibleState === isVisible) return;
+
+                lastVisibleState = isVisible;
+
+                if (isVisible) {
                     pasteButton.removeClass('noVNC_hidden');
+                    console.log('[PVE 粘贴输入] "显示额外按键"按钮可见 → 显示粘贴按钮');
+                } else {
+                    pasteButton.addClass('noVNC_hidden');
+                    console.log('[PVE 粘贴输入] "显示额外按键"按钮隐藏 → 隐藏粘贴按钮');
                 }
             };
 
-            // 尝试直接获取复选框
-            let viewOnlyCheckbox = document.getElementById('noVNC_setting_view_only');
+            // 为找到的按钮设置 IntersectionObserver
+            const setupIntersectionObserver = (extraKeysButton) => {
+                // 如果已经存在 observer，先断开
+                if (intersectionObserver) {
+                    intersectionObserver.disconnect();
+                }
 
-            if (viewOnlyCheckbox) {
-                // 复选框已存在，直接绑定
-                viewOnlyCheckbox.addEventListener('change', () => updateButtonVisibility(viewOnlyCheckbox));
-                updateButtonVisibility(viewOnlyCheckbox);
-                console.log('[PVE 粘贴输入] 已绑定"仅查看"监听器');
+                // 使用 IntersectionObserver 监听按钮的真实可见性
+                intersectionObserver = new IntersectionObserver((entries) => {
+                    // entries[0].isIntersecting 表示元素是否在视口中
+                    // 但我们需要检查元素是否真正可见（考虑 display:none 等）
+                    const entry = entries[0];
+                    const isVisible = entry.isIntersecting &&
+                                      entry.target.offsetParent !== null &&
+                                      entry.intersectionRatio > 0;
+
+                    updateButtonVisibility(isVisible);
+                }, {
+                    threshold: [0, 0.1]  // 监听元素进入和离开视口
+                });
+
+                intersectionObserver.observe(extraKeysButton);
+                console.log('[PVE 粘贴输入] 已设置 IntersectionObserver 监听"显示额外按键"按钮');
+
+                // 立即检查一次初始状态
+                const isVisible = extraKeysButton.offsetParent !== null &&
+                                  extraKeysButton.offsetWidth > 0 &&
+                                  extraKeysButton.offsetHeight > 0;
+                updateButtonVisibility(isVisible);
+            };
+
+            // 尝试直接获取"显示额外按键"按钮
+            let extraKeysButton = document.getElementById('noVNC_toggle_extra_keys_button');
+
+            if (extraKeysButton) {
+                // 按钮已存在，直接设置监听
+                console.log('[PVE 粘贴输入] 已找到"显示额外按键"按钮');
+                setupIntersectionObserver(extraKeysButton);
             } else {
-                // 复选框不存在，使用 MutationObserver 等待
-                const observer = new MutationObserver(() => {
-                    viewOnlyCheckbox = document.getElementById('noVNC_setting_view_only');
-                    if (viewOnlyCheckbox && !viewOnlyCheckbox.hasAttribute('data-paste-listener')) {
-                        viewOnlyCheckbox.setAttribute('data-paste-listener', 'true');
-                        viewOnlyCheckbox.addEventListener('change', () => updateButtonVisibility(viewOnlyCheckbox));
-                        updateButtonVisibility(viewOnlyCheckbox);
-
-                        // 找到目标后断开 Observer
-                        observer.disconnect();
-                        console.log('[PVE 粘贴输入] 已绑定"仅查看"监听器（延迟加载）');
+                // 按钮不存在，使用 MutationObserver 等待按钮出现
+                console.log('[PVE 粘贴输入] 等待"显示额外按键"按钮加载...');
+                const domObserver = new MutationObserver(() => {
+                    extraKeysButton = document.getElementById('noVNC_toggle_extra_keys_button');
+                    if (extraKeysButton) {
+                        console.log('[PVE 粘贴输入] 已找到"显示额外按键"按钮（延迟加载）');
+                        setupIntersectionObserver(extraKeysButton);
+                        // 注意：不断开 domObserver，以便处理按钮重建的情况
                     }
                 });
 
-                observer.observe(document.body, {
+                domObserver.observe(document.body, {
                     childList: true,
                     subtree: true
                 });
             }
         }
 
-        // 延迟初始化，确保 noVNC 已加载
-        setTimeout(() => {
-            setupViewOnlyListener(pasteButton);
-        }, CONFIG.DELAY.VIEW_ONLY_CHECK);
+        // 立即尝试同步（不延迟），确保按钮初始状态正确
+        syncWithExtraKeysButton(pasteButton);
 
         console.log('粘贴输入按钮已添加到 noVNC 控制栏');
         return pasteButton;
