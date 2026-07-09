@@ -1,15 +1,14 @@
 /**
- * PVE 粘贴输入脚本 - Nginx 注入版本
- * 适用于通过反向代理注入到 PVE 页面
- * 版本: 1.1
+ * PVE Paste Input script - Nginx injection version
+ * For deployment behind a reverse proxy that injects this script into the page
+ * Version: 2.0
  */
 
 // ============================================
-// 配置常量
+// Config constants
 // ============================================
 const CONFIG = {
-    MAX_CHARS: 3000,
-    CHAR_DELAY: 10, // 字符输入间隔（毫秒）
+    CHAR_DELAY: 50, // Delay between characters (ms)
     COLORS: {
         WARNING: '#FFCC00',
         PRIMARY: '#2196F3',
@@ -28,83 +27,327 @@ const CONFIG = {
     }
 };
 
+// ============================================
+// Persisted settings (localStorage)
+// ============================================
+const STORAGE_KEY_CHAR_DELAY = 'pve-paste-char-delay';
+
+// Restore the last saved typing speed, if any
+;(function loadStoredCharDelay() {
+    try {
+        const stored = parseInt(localStorage.getItem(STORAGE_KEY_CHAR_DELAY), 10);
+        // Accept any non-negative integer (no upper limit)
+        if (!isNaN(stored) && stored >= 0) {
+            CONFIG.CHAR_DELAY = stored;
+        }
+    } catch (e) {
+        // localStorage may be unavailable (e.g. private browsing) - fall back to the default
+        console.warn('[PVE Paste Input] Failed to read saved typing speed:', e);
+    }
+})();
+
+// Persist the current typing speed
+function saveCharDelay(value) {
+    try {
+        localStorage.setItem(STORAGE_KEY_CHAR_DELAY, String(value));
+    } catch (e) {
+        console.warn('[PVE Paste Input] Failed to save typing speed:', e);
+    }
+}
+
+// ============================================
+// Language detection and text dictionary
+// ============================================
+function detectLanguage() {
+    const cookieMatch = document.cookie.match(/(?:^|;\s*)PVELangCookie=([^;]+)/);
+    const cookieLang = cookieMatch ? decodeURIComponent(cookieMatch[1]) : '';
+
+    if (/^zh/i.test(cookieLang)) return 'zh';
+    if (/^en/i.test(cookieLang)) return 'en';
+
+    // Cookie missing or in another language, fall back to the browser language
+    const browserLang = navigator.language || navigator.userLanguage || '';
+    return /^zh/i.test(browserLang) ? 'zh' : 'en';
+}
+
+const I18N = {
+    zh: {
+        dialogTitle: '粘贴输入',
+        notice: '仅支持大小写字母、数字及常见符号，不支持中文、Emoji 及特殊符号',
+        placeholder: '在此粘贴要输入到虚拟机的文本...',
+        charWarning: '⚠️ 检测到不支持的字符，可能无法正确输入',
+        cancelBtn: '取消',
+        confirmBtn: '确认输入',
+        confirmDialogTitle: '⚠️ 字符警告',
+        confirmDialogBody: '检测到不支持的字符（中文、Emoji 及特殊符号等）<br/><br/>这些字符可能无法正确输入到虚拟机中。<br/><br/>是否仍要继续发送？',
+        confirmYesBtn: '继续发送',
+        alertNoCanvas: '未找到 noVNC canvas 元素',
+        alertNoCanvasSend: '未找到 noVNC canvas 元素，无法发送',
+        alertEmptyText: '请输入要粘贴的内容',
+        alertJQueryFail: '粘贴输入功能加载失败：无法加载 jQuery 库',
+        buttonTitle: '粘贴输入',
+        charCount: (len) => `已输入 ${len} 字符`,
+        speedLabel: '字符间隔（毫秒）',
+        speedHint: '字符间隔时间越小输入越快，但也越容易出错；如果输入出现错误，请适当增大字符间隔时间',
+        progressTitle: '正在输入…',
+        progressText: (current, total) => `已输入 ${current} / ${total} 字符`,
+        progressWarning: '请勿关闭或刷新页面',
+        progressCancelBtn: '取消输入',
+        progressCompleteText: '✓ 输入完成',
+        progressCancelledText: '已取消输入'
+    },
+    en: {
+        dialogTitle: 'Paste Input',
+        notice: 'Only letters, digits and common symbols are supported. Emoji and special symbols are not supported',
+        placeholder: 'Paste the text to type into the VM here...',
+        charWarning: '⚠️ Unsupported characters detected, may not input correctly',
+        cancelBtn: 'Cancel',
+        confirmBtn: 'Confirm',
+        confirmDialogTitle: '⚠️ Character Warning',
+        confirmDialogBody: 'Unsupported characters detected (emoji, special symbols, etc.)<br/><br/>These characters may not be entered correctly into the VM.<br/><br/>Continue sending anyway?',
+        confirmYesBtn: 'Send Anyway',
+        alertNoCanvas: 'noVNC canvas element not found',
+        alertNoCanvasSend: 'noVNC canvas element not found, cannot send',
+        alertEmptyText: 'Please enter the content to paste',
+        alertJQueryFail: 'Failed to load paste input feature: could not load jQuery',
+        buttonTitle: 'Paste Input',
+        charCount: (len) => `${len} characters entered`,
+        speedLabel: 'Char interval (ms)',
+        speedHint: 'A smaller interval types faster but is more error-prone; if the input is incorrect, try increasing the interval',
+        progressTitle: 'Typing…',
+        progressText: (current, total) => `${current} / ${total} characters typed`,
+        progressWarning: 'Do not close or refresh the page',
+        progressCancelBtn: 'Cancel',
+        progressCompleteText: '✓ Input complete',
+        progressCancelledText: 'Input cancelled'
+    }
+};
+
+const T = I18N[detectLanguage()];
+
+// ============================================
+// Plan A capture hook (must run before noVNC's module executes)
+//
+// noVNC keeps its RFB instance module-scoped, so it is unreachable from the page.
+// However the RFB constructor calls `<method>.bind(this)` many times during setup,
+// where `this` is the RFB instance. By wrapping Function.prototype.bind before
+// noVNC loads we capture that instance the first time it binds one of its own
+// methods, then restore the original bind immediately (one-shot).
+//
+// NOTE: for this to work the reverse proxy must inject this script BEFORE noVNC's
+// scripts (e.g. high in <head>). If it captures nothing, sendString() falls back
+// to synthetic KeyboardEvents automatically.
+// ============================================
+;(function installRFBCaptureHook() {
+    try {
+        const origBind = Function.prototype.bind;
+        Function.prototype.bind = function (thisArg) {
+            try {
+                if (thisArg && typeof thisArg === 'object'
+                    && typeof thisArg.sendKey === 'function'
+                    && '_rfbConnectionState' in thisArg) {
+                    window.__pveCapturedRFB = thisArg;
+                    Function.prototype.bind = origBind; // one-shot: stop intercepting
+                    console.log('[PVE Paste Input] Captured noVNC RFB instance at construction (Plan A ready)');
+                }
+            } catch (e) { /* ignore and fall through to the real bind */ }
+            return origBind.apply(this, arguments);
+        };
+    } catch (e) {
+        console.warn('[PVE Paste Input] Failed to install RFB capture hook:', e);
+    }
+})();
+
 (function() {
     'use strict';
 
-    // 检查是否在 noVNC 页面
+    // Check whether we're on a noVNC page
     function isNoVNCPage() {
         return window.location.href.includes('novnc') || document.querySelector('.noVNC_scroll');
     }
 
-    // 等待 jQuery 加载
+    // Wait for jQuery to load
     function loadjQuery(callback) {
         if (typeof jQuery !== 'undefined') {
             callback(jQuery);
             return;
         }
 
-        // 动态加载 jQuery
+        // Dynamically load jQuery
         var script = document.createElement('script');
         script.src = 'https://code.jquery.com/jquery-3.3.1.min.js';
         script.onload = function() {
             callback(jQuery.noConflict(true));
         };
         script.onerror = function() {
-            console.error('[PVE 粘贴输入] 无法加载 jQuery，请检查网络或文件路径');
-            alert('粘贴输入功能加载失败：无法加载 jQuery 库');
+            console.error('[PVE Paste Input] Failed to load jQuery, check your network or file path');
+            alert(T.alertJQueryFail);
         };
         document.head.appendChild(script);
     }
 
-    // 发送字符串到 noVNC
-    window.sendString = function(text) {
-        var el = document.getElementById("canvas-id");
-        if (!el) {
-            alert('未找到 noVNC canvas 元素');
-            return;
+    // ============================================
+    // Plan A: drive noVNC's own RFB.sendKey(keysym, code, down) directly.
+    //
+    // Calling sendKey() hands noVNC the keysym + code directly, avoiding the
+    // fragile "synthesize a KeyboardEvent and hope noVNC re-derives it" round-trip.
+    // PVE runs QEMU, whose VNC server uses the QEMU Extended Key Event encoding:
+    // noVNC then sends the *scancode* (mapped from `code`) and the guest applies
+    // its own modifier state, so an explicit Shift press is required for shifted
+    // characters - exactly mirroring a physical keyboard.
+    // ============================================
+    const XK_Shift_L = 0xffe1;
+    const XK_Return = 0xff0d;
+    const XK_Tab = 0xff09;
+
+    // Cached RFB instance once located
+    let _rfbCache = null;
+
+    // Duck-typing check: a noVNC RFB instance exposes sendKey() plus internal fields
+    function looksLikeRFB(o) {
+        return o && typeof o === 'object'
+            && typeof o.sendKey === 'function'
+            && ('_rfbConnectionState' in o || '_sock' in o || '_fbName' in o);
+    }
+
+    // Locate the live RFB instance: prefer the one captured at construction by the
+    // bind hook; otherwise probe common globals and duck-type scan window. Cached.
+    function findRFB() {
+        if (looksLikeRFB(_rfbCache)) return _rfbCache;
+        _rfbCache = null;
+
+        // 0) Instance captured at construction time by the bind hook (preferred)
+        if (looksLikeRFB(window.__pveCapturedRFB)) { _rfbCache = window.__pveCapturedRFB; return _rfbCache; }
+
+        // 1) Common explicit handles
+        const direct = [
+            window.rfb,
+            window.UI && window.UI.rfb,
+            window.RFB && window.RFB.rfb
+        ];
+        for (const c of direct) {
+            if (looksLikeRFB(c)) { _rfbCache = c; return _rfbCache; }
         }
 
-        // 开始前先重置所有修饰键状态
-        resetModifierKeys(el);
+        // 2) Duck-type scan of window's own properties (+ one level deep)
+        const skip = new Set(['window', 'self', 'top', 'parent', 'frames',
+            'document', 'location', 'navigator', 'history', 'localStorage',
+            'sessionStorage', 'console', 'external']);
+        let keys = [];
+        try { keys = Object.keys(window); } catch (e) { keys = []; }
+        for (const k of keys) {
+            if (skip.has(k)) continue;
+            let v;
+            try { v = window[k]; } catch (e) { continue; }
+            if (!v || typeof v !== 'object') continue;
+            if (looksLikeRFB(v)) { _rfbCache = v; return _rfbCache; }
+            let subkeys = [];
+            try { subkeys = Object.keys(v); } catch (e) { continue; }
+            for (const k2 of subkeys) {
+                let v2;
+                try { v2 = v[k2]; } catch (e) { continue; }
+                if (looksLikeRFB(v2)) { _rfbCache = v2; return _rfbCache; }
+            }
+        }
+        return _rfbCache; // null if not found
+    }
 
-        // 逐字符发送，使用真实的延迟
+    // Emit a single character through the RFB API
+    function emitCharRFB(rfb, ch) {
+        if (ch === '\n' || ch === '\r') { rfb.sendKey(XK_Return, 'Enter'); return; }
+        if (ch === '\t') { rfb.sendKey(XK_Tab, 'Tab'); return; }
+
+        // keysym for printable ASCII is just its code point; code drives the scancode
+        const keysym = ch.charCodeAt(0);
+        const code = getKeyName(ch);
+        const needsShift = /[A-Z!@#$%^&*()_+{}:"<>?~|]/.test(ch);
+
+        if (needsShift) {
+            rfb.sendKey(XK_Shift_L, 'ShiftLeft', true);
+            rfb.sendKey(keysym, code, true);
+            rfb.sendKey(keysym, code, false);
+            rfb.sendKey(XK_Shift_L, 'ShiftLeft', false);
+        } else {
+            rfb.sendKey(keysym, code, true);
+            rfb.sendKey(keysym, code, false);
+        }
+    }
+
+    // Send a string to noVNC
+    window.sendString = function(text, callbacks) {
+        callbacks = callbacks || {};
+
+        // Prefer Plan A (direct RFB API); fall back to synthetic KeyboardEvents
+        const rfb = findRFB();
+        const el = document.getElementById("canvas-id");
+
+        if (rfb) {
+            console.log('[PVE Paste Input] Plan A: using noVNC RFB.sendKey() directly');
+        } else {
+            if (!el) {
+                alert(T.alertNoCanvas);
+                return null;
+            }
+            console.log('[PVE Paste Input] Plan A unavailable (no RFB instance found), falling back to KeyboardEvent dispatch');
+            // Reset all modifier key states before starting
+            resetModifierKeys(el);
+        }
+
+        // Send character by character with a real delay
         let index = 0;
+        let cancelled = false;
+        const total = text.length;
         const sendChar = () => {
+            if (cancelled) {
+                // Make sure modifier keys are released again after cancelling
+                if (!rfb) resetModifierKeys(el);
+                if (callbacks.onCancelled) callbacks.onCancelled(index, total);
+                return;
+            }
+
             if (index >= text.length) {
-                // 发送完成后再次确保修饰键释放
-                resetModifierKeys(el);
+                // Make sure modifier keys are released again after sending completes
+                if (!rfb) resetModifierKeys(el);
+                if (callbacks.onComplete) callbacks.onComplete(total);
                 return;
             }
 
             const x = text[index];
-            let evt;
 
-            // 处理换行符
-            if (x === '\n' || x === '\r') {
-                // 发送 Enter 键
-                evt = new KeyboardEvent("keydown", {key: 'Enter', keyCode: 13, code: 'Enter'});
-                el.dispatchEvent(evt);
-                evt = new KeyboardEvent("keyup", {key: 'Enter', keyCode: 13, code: 'Enter'});
-                el.dispatchEvent(evt);
-            } else if (x === '\t') {
-                // 发送 Tab 键
-                evt = new KeyboardEvent("keydown", {key: 'Tab', keyCode: 9, code: 'Tab'});
-                el.dispatchEvent(evt);
-                evt = new KeyboardEvent("keyup", {key: 'Tab', keyCode: 9, code: 'Tab'});
-                el.dispatchEvent(evt);
+            if (rfb) {
+                // Plan A: hand the keysym/code straight to noVNC
+                emitCharRFB(rfb, x);
             } else {
-                // 发送普通字符
-                sendCharWithKeyboard(el, x);
+                // Plan B: synthetic KeyboardEvents dispatched to the canvas
+                let evt;
+                if (x === '\n' || x === '\r') {
+                    evt = new KeyboardEvent("keydown", {key: 'Enter', keyCode: 13, code: 'Enter'});
+                    el.dispatchEvent(evt);
+                    evt = new KeyboardEvent("keyup", {key: 'Enter', keyCode: 13, code: 'Enter'});
+                    el.dispatchEvent(evt);
+                } else if (x === '\t') {
+                    evt = new KeyboardEvent("keydown", {key: 'Tab', keyCode: 9, code: 'Tab'});
+                    el.dispatchEvent(evt);
+                    evt = new KeyboardEvent("keyup", {key: 'Tab', keyCode: 9, code: 'Tab'});
+                    el.dispatchEvent(evt);
+                } else {
+                    sendCharWithKeyboard(el, x);
+                }
             }
 
             index++;
+            if (callbacks.onProgress) callbacks.onProgress(index, total);
             setTimeout(sendChar, CONFIG.CHAR_DELAY);
         };
 
         sendChar();
+
+        return {
+            cancel: () => { cancelled = true; }
+        };
     };
 
-    // 重置所有修饰键状态
+    // Reset all modifier key states
     function resetModifierKeys(el) {
         const modifiers = [
             {keyCode: 16, code: 'ShiftLeft', key: 'Shift'},
@@ -115,7 +358,7 @@ const CONFIG = {
             {keyCode: 18, code: 'AltRight', key: 'Alt'}
         ];
 
-        // 发送多次 keyup 确保释放（以防状态残留）
+        // Send keyup multiple times to make sure it's released (in case state lingers)
         modifiers.forEach(mod => {
             const evt = new KeyboardEvent("keyup", {
                 keyCode: mod.keyCode,
@@ -127,31 +370,31 @@ const CONFIG = {
         });
     }
 
-    // 改进的 KeyboardEvent 发送（带状态清理和延迟确认）
+    // Improved KeyboardEvent dispatch (with state cleanup and delayed confirmation)
     function sendCharWithKeyboard(el, char) {
         let evt;
 
-        // 判断是否需要 Shift
+        // Determine whether Shift is needed
         const needsShift = char.match(/[A-Z!@#$%^&*()_+{}:"<>?~|]/);
 
         if (needsShift) {
-            // 特殊处理：先确保 Shift 完全释放
+            // Special handling: make sure Shift is fully released first
             evt = new KeyboardEvent("keyup", {keyCode: 16, code: 'ShiftLeft', key: 'Shift'});
             el.dispatchEvent(evt);
             evt = new KeyboardEvent("keyup", {keyCode: 16, code: 'ShiftRight', key: 'Shift'});
             el.dispatchEvent(evt);
 
-            // 按下 Shift
+            // Press Shift
             evt = new KeyboardEvent("keydown", {
                 keyCode: 16,
                 code: 'ShiftLeft',
                 key: 'Shift',
-                shiftKey: false,  // 明确标记状态转换前
+                shiftKey: false,  // Explicitly mark the state before the transition
                 bubbles: true
             });
             el.dispatchEvent(evt);
 
-            // 发送字符键（带 shiftKey 标记）
+            // Send the character key (with the shiftKey flag)
             const keyCode = getKeyCode(char);
             evt = new KeyboardEvent("keydown", {
                 key: char,
@@ -171,22 +414,22 @@ const CONFIG = {
             });
             el.dispatchEvent(evt);
 
-            // 释放 Shift（立即释放）
+            // Release Shift (release immediately)
             evt = new KeyboardEvent("keyup", {
                 keyCode: 16,
                 code: 'ShiftLeft',
                 key: 'Shift',
-                shiftKey: false,  // 明确标记状态转换后
+                shiftKey: false,  // Explicitly mark the state after the transition
                 bubbles: true
             });
             el.dispatchEvent(evt);
 
-            // 二次确保释放（延迟一点点，以防异步问题）
+            // Release again just in case (slight delay, to guard against async issues)
             evt = new KeyboardEvent("keyup", {keyCode: 16, code: 'ShiftLeft', key: 'Shift'});
             el.dispatchEvent(evt);
         } else {
-            // 不需要 Shift 的字符
-            // 先确保 Shift 未按下
+            // Character that doesn't need Shift
+            // Make sure Shift isn't pressed first
             evt = new KeyboardEvent("keyup", {keyCode: 16, code: 'ShiftLeft', key: 'Shift'});
             el.dispatchEvent(evt);
 
@@ -211,9 +454,9 @@ const CONFIG = {
         }
     }
 
-    // 获取字符的 keyCode
+    // Get the keyCode for a character
     function getKeyCode(char) {
-        // 特殊符号映射到对应的数字键 keyCode
+        // Map special symbols to their corresponding digit-key keyCode
         const specialChars = {
             '!': 49, '@': 50, '#': 51, '$': 52, '%': 53,
             '^': 54, '&': 55, '*': 56, '(': 57, ')': 48,
@@ -226,11 +469,11 @@ const CONFIG = {
             return specialChars[char];
         }
 
-        // 字母和数字直接使用 charCodeAt
+        // Letters and digits use charCodeAt directly
         return char.toUpperCase().charCodeAt(0);
     }
 
-    // 获取字符的 code 属性
+    // Get the code property for a character
     function getKeyName(char) {
         const codeMap = {
             '1': 'Digit1', '2': 'Digit2', '3': 'Digit3', '4': 'Digit4', '5': 'Digit5',
@@ -252,7 +495,7 @@ const CONFIG = {
             return codeMap[char];
         }
 
-        // 字母
+        // Letter
         if (char.match(/[a-zA-Z]/)) {
             return 'Key' + char.toUpperCase();
         }
@@ -260,9 +503,9 @@ const CONFIG = {
         return 'Key' + char.toUpperCase();
     }
 
-    // 创建模态对话框（使用 jQuery）
+    // Create the modal dialog (using jQuery)
     function createPasteDialog($) {
-        // 对话框容器 - 使用响应式尺寸
+        // Dialog container - uses responsive sizing
         const dialog = $(`
             <div id="paste-dialog" style="
                 position: fixed;
@@ -281,10 +524,10 @@ const CONFIG = {
                 display: none;
                 box-sizing: border-box;
             ">
-                <h3 style="margin: 0 0 15px 0; color: #fff; font-size: 16px;">粘贴输入</h3>
-                <div style="margin-bottom: 10px; padding: 8px; background: rgba(33, 150, 243, 0.15); border-left: 3px solid ${CONFIG.COLORS.PRIMARY}; font-size: 12px; color: ${CONFIG.COLORS.TEXT_LIGHT};">
-
-                    <strong>仅支持大小写字母、数字及常见符号，不支持中文、Emoji 及特殊符号</strong>
+                <h3 style="margin: 0 0 15px 0; color: #fff; font-size: 16px;">${T.dialogTitle}</h3>
+                <div style="margin-bottom: 10px; padding: 8px; background: rgba(33, 150, 243, 0.15); border-left: 3px solid ${CONFIG.COLORS.PRIMARY}; font-size: 12px; color: ${CONFIG.COLORS.TEXT_LIGHT}; line-height: 1.6;">
+                    <div>· ${T.notice}</div>
+                    <div>· ${T.speedHint}</div>
                 </div>
                 <textarea id="paste-textarea" style="
                     width: 100%;
@@ -300,7 +543,7 @@ const CONFIG = {
                     box-sizing: border-box;
                     background: ${CONFIG.COLORS.BG};
                     color: ${CONFIG.COLORS.TEXT};
-                " placeholder="在此粘贴要输入到虚拟机的文本..."></textarea>
+                " placeholder="${T.placeholder}"></textarea>
                 <div id="paste-char-warning" style="
                     margin-top: 8px;
                     padding: 8px;
@@ -310,53 +553,91 @@ const CONFIG = {
                     color: ${CONFIG.COLORS.WARNING};
                     display: none;
                 ">
-                    ⚠️ 检测到不支持的字符，可能无法正确输入
+                    ${T.charWarning}
                 </div>
-                <div id="paste-length-warning" style="
+                <div style="
                     margin-top: 8px;
-                    padding: 8px;
-                    background: rgba(255, 204, 0, 0.2);
-                    border-left: 3px solid ${CONFIG.COLORS.WARNING};
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
                     font-size: 12px;
-                    color: ${CONFIG.COLORS.WARNING};
-                    display: none;
                 ">
-                    ⚠️ 字符数超出限制（最多 ${CONFIG.MAX_CHARS} 字符），无法发送
+                    <label for="paste-speed-input" style="color: ${CONFIG.COLORS.TEXT_LIGHT}; white-space: nowrap;">${T.speedLabel}</label>
+                    <span id="paste-char-count" style="
+                        color: ${CONFIG.COLORS.GRAY};
+                        font-family: monospace;
+                    ">${T.charCount(0)}</span>
                 </div>
-                <div id="paste-char-count" style="
-                    margin-top: 8px;
-                    text-align: right;
-                    font-size: 12px;
-                    color: ${CONFIG.COLORS.GRAY};
-                    font-family: monospace;
-                ">
-                    0/${CONFIG.MAX_CHARS}
-                </div>
-                <div style="margin-top: 15px; text-align: right;">
-                    <button id="paste-cancel-btn" style="
-                        padding: 8px 20px;
-                        margin-right: 10px;
-                        border: 1px solid ${CONFIG.COLORS.BORDER};
-                        border-radius: 4px;
-                        background: ${CONFIG.COLORS.BG_DARK};
-                        color: ${CONFIG.COLORS.TEXT};
-                        cursor: pointer;
-                        font-size: 14px;
-                    ">取消</button>
-                    <button id="paste-confirm-btn" style="
-                        padding: 8px 20px;
-                        border: none;
-                        border-radius: 4px;
-                        background: ${CONFIG.COLORS.PRIMARY};
-                        color: white;
-                        cursor: pointer;
-                        font-size: 14px;
-                    ">确认输入</button>
+                <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+                    <div id="paste-speed-control" style="display: flex; align-items: center;">
+                        <div style="display: inline-flex; align-items: stretch; border: 1px solid ${CONFIG.COLORS.BORDER}; border-radius: 4px; overflow: hidden; height: 35px;">
+                            <button type="button" id="paste-speed-minus" style="
+                                width: 30px;
+                                border: none;
+                                border-right: 1px solid ${CONFIG.COLORS.BORDER};
+                                background: ${CONFIG.COLORS.BG_DARK};
+                                color: ${CONFIG.COLORS.TEXT};
+                                cursor: pointer;
+                                font-size: 18px;
+                                line-height: 1;
+                                user-select: none;
+                                padding: 0;
+                            ">&minus;</button>
+                            <input type="text" inputmode="numeric" id="paste-speed-input" value="${CONFIG.CHAR_DELAY}" style="
+                                width: 56px;
+                                border: none;
+                                background: ${CONFIG.COLORS.BG_DARK};
+                                color: ${CONFIG.COLORS.TEXT};
+                                font-size: 13px;
+                                font-family: monospace;
+                                text-align: center;
+                                box-sizing: border-box;
+                                padding: 0 4px;
+                            " />
+                            <button type="button" id="paste-speed-plus" style="
+                                width: 30px;
+                                border: none;
+                                border-left: 1px solid ${CONFIG.COLORS.BORDER};
+                                background: ${CONFIG.COLORS.BG_DARK};
+                                color: ${CONFIG.COLORS.TEXT};
+                                cursor: pointer;
+                                font-size: 18px;
+                                line-height: 1;
+                                user-select: none;
+                                padding: 0;
+                            ">+</button>
+                        </div>
+                    </div>
+                    <div style="flex-shrink: 0; white-space: nowrap;">
+                        <button id="paste-cancel-btn" style="
+                            height: 35px;
+                            padding: 0 20px;
+                            margin-right: 10px;
+                            border: 1px solid ${CONFIG.COLORS.BORDER};
+                            border-radius: 4px;
+                            background: ${CONFIG.COLORS.BG_DARK};
+                            color: ${CONFIG.COLORS.TEXT};
+                            cursor: pointer;
+                            font-size: 14px;
+                            box-sizing: border-box;
+                        ">${T.cancelBtn}</button>
+                        <button id="paste-confirm-btn" style="
+                            height: 35px;
+                            padding: 0 20px;
+                            border: none;
+                            border-radius: 4px;
+                            background: ${CONFIG.COLORS.PRIMARY};
+                            color: white;
+                            cursor: pointer;
+                            font-size: 14px;
+                            box-sizing: border-box;
+                        ">${T.confirmBtn}</button>
+                    </div>
                 </div>
             </div>
         `);
 
-        // 遮罩层
+        // Overlay
         const overlay = $(`
             <div id="paste-overlay" style="
                 position: fixed;
@@ -370,7 +651,7 @@ const CONFIG = {
             "></div>
         `);
 
-        // 自定义确认对话框
+        // Custom confirmation dialog
         const confirmDialog = $(`
             <div id="paste-confirm-dialog" style="
                 position: fixed;
@@ -389,12 +670,10 @@ const CONFIG = {
                 box-sizing: border-box;
             ">
                 <h3 style="margin: 0 0 15px 0; color: ${CONFIG.COLORS.WARNING}; font-size: 18px;">
-                    ⚠️ 字符警告
+                    ${T.confirmDialogTitle}
                 </h3>
                 <div style="color: ${CONFIG.COLORS.TEXT}; font-size: 14px; line-height: 1.6; margin-bottom: 20px;">
-                    检测到不支持的字符（中文、Emoji 及特殊符号等）<br/><br/>
-                    这些字符可能无法正确输入到虚拟机中。<br/><br/>
-                    是否仍要继续发送？
+                    ${T.confirmDialogBody}
                 </div>
                 <div style="text-align: right;">
                     <button id="paste-confirm-no" style="
@@ -406,7 +685,7 @@ const CONFIG = {
                         color: ${CONFIG.COLORS.TEXT};
                         cursor: pointer;
                         font-size: 14px;
-                    ">取消</button>
+                    ">${T.cancelBtn}</button>
                     <button id="paste-confirm-yes" style="
                         padding: 8px 20px;
                         border: none;
@@ -416,52 +695,134 @@ const CONFIG = {
                         cursor: pointer;
                         font-size: 14px;
                         font-weight: bold;
-                    ">继续发送</button>
+                    ">${T.confirmYesBtn}</button>
                 </div>
             </div>
         `);
 
-        $('body').append(overlay).append(dialog).append(confirmDialog);
+        // Progress overlay (blocks page interaction while typing is in progress;
+        // kept visually transparent so the console stays visible underneath)
+        const progressOverlay = $(`
+            <div id="paste-progress-overlay" style="
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0,0,0,0);
+                cursor: not-allowed;
+                z-index: 10002;
+                display: none;
+            "></div>
+        `);
 
-        // 设置 placeholder 颜色
-        const style = $('<style>#paste-textarea::placeholder { color: #888; opacity: 1; }</style>');
+        // Progress panel - pinned to the bottom-right corner so it doesn't cover
+        // the console while the user watches the input happen
+        const progressPanel = $(`
+            <div id="paste-progress-panel" style="
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: ${CONFIG.COLORS.BG};
+                border: 1px solid ${CONFIG.COLORS.BORDER};
+                border-radius: 8px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.7);
+                padding: 16px 18px;
+                z-index: 10003;
+                width: 280px;
+                max-width: calc(100vw - 40px);
+                display: none;
+                box-sizing: border-box;
+                text-align: left;
+            ">
+                <h3 style="margin: 0 0 10px 0; color: #fff; font-size: 14px;">${T.progressTitle}</h3>
+                <div style="background: ${CONFIG.COLORS.BG_DARK}; border-radius: 4px; height: 8px; overflow: hidden; margin-bottom: 8px;">
+                    <div id="paste-progress-bar" style="height: 100%; width: 0%; background: ${CONFIG.COLORS.PRIMARY}; transition: width 0.1s linear;"></div>
+                </div>
+                <div id="paste-progress-text" style="font-size: 12px; color: ${CONFIG.COLORS.TEXT}; margin-bottom: 8px; font-family: monospace;"></div>
+                <div style="font-size: 11px; color: ${CONFIG.COLORS.WARNING}; margin-bottom: 12px;">${T.progressWarning}</div>
+                <button id="paste-progress-cancel-btn" style="
+                    width: 100%;
+                    padding: 6px 20px;
+                    border: 1px solid ${CONFIG.COLORS.BORDER};
+                    border-radius: 4px;
+                    background: ${CONFIG.COLORS.BG_DARK};
+                    color: ${CONFIG.COLORS.TEXT};
+                    cursor: pointer;
+                    font-size: 13px;
+                ">${T.progressCancelBtn}</button>
+            </div>
+        `);
+
+        // Toast notification (non-blocking) - appears in the same bottom-right spot
+        // as the progress panel, so completion/cancel feedback replaces it in place
+        const toast = $(`
+            <div id="paste-toast" style="
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: ${CONFIG.COLORS.BG};
+                border: 1px solid ${CONFIG.COLORS.BORDER};
+                border-radius: 8px;
+                padding: 14px 18px;
+                color: ${CONFIG.COLORS.TEXT};
+                font-size: 14px;
+                z-index: 10004;
+                display: none;
+                width: 280px;
+                max-width: calc(100vw - 40px);
+                box-sizing: border-box;
+                text-align: center;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.7);
+            "></div>
+        `);
+
+        $('body').append(overlay).append(dialog).append(confirmDialog).append(progressOverlay).append(progressPanel).append(toast);
+
+        // Set the placeholder color and pin the stepper button/input sizes so PVE's
+        // host CSS (which stretches <button> elements) can't blow them up
+        const style = $(`<style>
+            #paste-textarea::placeholder { color: #888; opacity: 1; }
+            #paste-speed-minus, #paste-speed-plus {
+                width: 36px !important;
+                min-width: 36px !important;
+                max-width: 36px !important;
+                flex: 0 0 36px !important;
+                box-sizing: border-box !important;
+            }
+            #paste-speed-input {
+                width: 60px !important;
+                min-width: 60px !important;
+                max-width: 60px !important;
+                flex: 0 0 60px !important;
+                box-sizing: border-box !important;
+            }
+            #paste-cancel-btn, #paste-confirm-btn {
+                height: 35px !important;
+                box-sizing: border-box !important;
+            }
+        </style>`);
         $('head').append(style);
 
-        // 检测非 ASCII 字符
+        // Detect non-ASCII characters
         function checkUnsupportedChars(text) {
-            // ASCII 可打印字符范围：32-126，加上换行符 (10) 和回车符 (13)
+            // ASCII printable range: 32-126, plus newline (10), carriage return (13) and tab (9)
             const hasUnsupported = [...text].some(char => {
                 const code = char.charCodeAt(0);
-                return code > 126 || (code < 32 && code !== 10 && code !== 13 && code !== 9); // 允许换行、回车、Tab
+                return code > 126 || (code < 32 && code !== 10 && code !== 13 && code !== 9); // Allow newline, carriage return, tab
             });
             return hasUnsupported;
         }
 
-        // 检测字符数是否超出限制
-        function isTextTooLong(text) {
-            return text.length > CONFIG.MAX_CHARS;
-        }
-
-        // 实时检测文本框内容
+        // Live-check the textarea content
         $('#paste-textarea').on('input', function() {
             const text = $(this).val();
             const length = text.length;
 
-            // 更新字符计数显示
-            const $charCount = $('#paste-char-count');
-            $charCount.text(length + '/' + CONFIG.MAX_CHARS);
+            // Update the character count display
+            $('#paste-char-count').text(T.charCount(length));
 
-            // 超出限制时变为黄色警告
-            if (isTextTooLong(text)) {
-                $charCount.css('color', CONFIG.COLORS.WARNING);
-                $charCount.text('⚠️ ' + length + '/' + CONFIG.MAX_CHARS);
-                $('#paste-length-warning').show();
-            } else {
-                $charCount.css('color', CONFIG.COLORS.GRAY);
-                $('#paste-length-warning').hide();
-            }
-
-            // 检测不支持的字符
+            // Detect unsupported characters
             if (text && checkUnsupportedChars(text)) {
                 $('#paste-char-warning').show();
             } else {
@@ -469,7 +830,51 @@ const CONFIG = {
             }
         });
 
-        // 统一的按钮悬停效果
+        // Speed control: read/write the current typing delay (numeric only, no upper limit)
+        const $speedInput = $('#paste-speed-input');
+
+        function getSpeedValue() {
+            const v = parseInt($speedInput.val(), 10);
+            return (isNaN(v) || v < 0) ? CONFIG.CHAR_DELAY : v;
+        }
+
+        function applySpeed(value, writeToInput) {
+            value = Math.max(0, value);
+            CONFIG.CHAR_DELAY = value;
+            if (writeToInput) $speedInput.val(value);
+            saveCharDelay(value);
+        }
+
+        // Typing directly into the field (strip any non-digit characters)
+        $speedInput.on('input', function() {
+            const cleaned = this.value.replace(/[^0-9]/g, '');
+            if (cleaned !== this.value) {
+                this.value = cleaned;
+            }
+            const value = parseInt(cleaned, 10);
+            // Only apply a valid non-negative number; don't rewrite the field mid-typing
+            if (!isNaN(value) && value >= 0) {
+                applySpeed(value, false);
+            }
+        });
+
+        // On blur, restore the current value if the field was left empty or invalid
+        $speedInput.on('blur', function() {
+            const value = parseInt(this.value, 10);
+            if (isNaN(value) || value < 0) {
+                this.value = CONFIG.CHAR_DELAY;
+            }
+        });
+
+        // Minus / plus stepper buttons
+        $('#paste-speed-minus').click(function() {
+            applySpeed(getSpeedValue() - 1, true);
+        });
+        $('#paste-speed-plus').click(function() {
+            applySpeed(getSpeedValue() + 1, true);
+        });
+
+        // Shared button hover effect
         function addButtonHoverEffect(...selectors) {
             selectors.forEach(selector => {
                 $(selector).hover(
@@ -479,132 +884,186 @@ const CONFIG = {
             });
         }
 
-        // 应用悬停效果到所有按钮
+        // Apply the hover effect to all buttons
         addButtonHoverEffect(
             '#paste-confirm-btn',
             '#paste-cancel-btn',
             '#paste-confirm-yes',
-            '#paste-confirm-no'
+            '#paste-confirm-no',
+            '#paste-progress-cancel-btn',
+            '#paste-speed-minus',
+            '#paste-speed-plus'
         );
 
-        // ESC 键处理函数
+        // ESC key handler
         const handleEscKey = (e) => {
             if (e.key === 'Escape') {
                 closeDialog();
             }
         };
 
-        // 关闭对话框
+        // Close the dialog
         const closeDialog = () => {
             dialog.hide();
             overlay.hide();
             $('#paste-textarea').val('');
             $('#paste-char-warning').hide();
-            $('#paste-length-warning').hide();
-            // 重置字符计数
-            $('#paste-char-count').text('0/' + CONFIG.MAX_CHARS).css('color', CONFIG.COLORS.GRAY);
-            // 解绑 ESC 键监听
+            // Reset the character count
+            $('#paste-char-count').text(T.charCount(0));
+            // Unbind the ESC key listener
             $(document).off('keydown', handleEscKey);
         };
 
-        // 显示对话框时绑定 ESC 键
+        // Bind the ESC key when showing the dialog
         const showDialog = () => {
             $('#paste-overlay').show();
             $('#paste-dialog').show();
             $('#paste-textarea').focus();
-            // 绑定 ESC 键监听
+            // Bind the ESC key listener
             $(document).on('keydown', handleEscKey);
         };
 
-        // 执行发送的函数
+        // Track the in-flight send so the cancel button can stop it
+        let currentSendController = null;
+
+        // Show the progress panel and block page interaction
+        function showProgressPanel(total) {
+            $('#paste-progress-text').text(T.progressText(0, total));
+            $('#paste-progress-bar').css('width', '0%');
+            $('#paste-progress-cancel-btn').prop('disabled', false);
+            $('#paste-progress-overlay, #paste-progress-panel').show();
+            // Warn on refresh/close while typing is in progress
+            window.onbeforeunload = function(e) {
+                e.preventDefault();
+                e.returnValue = '';
+                return '';
+            };
+        }
+
+        // Update the progress panel with the current typing position
+        function updateProgress(current, total) {
+            $('#paste-progress-text').text(T.progressText(current, total));
+            $('#paste-progress-bar').css('width', (current / total * 100) + '%');
+        }
+
+        // Hide the progress panel and unblock the page
+        function hideProgressPanel() {
+            $('#paste-progress-overlay, #paste-progress-panel').hide();
+            window.onbeforeunload = null;
+            currentSendController = null;
+        }
+
+        // Show a brief non-blocking toast message
+        function showToast(text) {
+            $('#paste-toast').text(text).stop(true, true).fadeIn(150).delay(2500).fadeOut(400);
+        }
+
+        // Return focus to the canvas (fail silently)
+        function focusCanvas(canvas) {
+            setTimeout(() => {
+                try {
+                    canvas.focus();
+                    canvas.click(); // Simulate a click to make sure it's focused
+                } catch (e) {
+                    console.warn('[PVE Paste Input] Failed to focus canvas:', e);
+                }
+            }, CONFIG.DELAY.CANVAS_FOCUS);
+        }
+
+        // The function that actually sends the text
         function sendTextToVNC() {
             const text = $('#paste-textarea').val();
 
-            // 提前检查 canvas 是否存在
+            // Check the canvas exists beforehand
             const canvas = document.getElementById("canvas-id");
             if (!canvas) {
-                alert('未找到 noVNC canvas 元素，无法发送');
+                alert(T.alertNoCanvasSend);
                 return;
             }
 
             closeDialog();
 
-            // 延迟执行，确保对话框已关闭
+            // Delay execution to make sure the dialog has closed
             setTimeout(() => {
-                window.sendString(text);
-
-                // 发送完成后，将焦点返回到 canvas（静默失败）
-                setTimeout(() => {
-                    try {
-                        canvas.focus();
-                        canvas.click(); // 模拟点击以确保焦点
-                    } catch (e) {
-                        console.warn('[PVE 粘贴输入] 无法聚焦 canvas:', e);
+                showProgressPanel(text.length);
+                currentSendController = window.sendString(text, {
+                    onProgress: updateProgress,
+                    onComplete: () => {
+                        hideProgressPanel();
+                        showToast(T.progressCompleteText);
+                        focusCanvas(canvas);
+                    },
+                    onCancelled: () => {
+                        hideProgressPanel();
+                        showToast(T.progressCancelledText);
+                        focusCanvas(canvas);
                     }
-                }, CONFIG.DELAY.CANVAS_FOCUS);
+                });
             }, CONFIG.DELAY.DIALOG_CLOSE);
         }
 
-        // 确认按钮
+        // Cancel an in-flight send
+        $('#paste-progress-cancel-btn').click(function() {
+            if (currentSendController) {
+                $(this).prop('disabled', true);
+                currentSendController.cancel();
+            }
+        });
+
+        // Confirm button
         $('#paste-confirm-btn').click(function() {
             const text = $('#paste-textarea').val();
             if (!text) {
-                alert('请输入要粘贴的内容');
+                alert(T.alertEmptyText);
                 return;
             }
 
-            // 检查字符数限制
-            if (isTextTooLong(text)) {
-                alert('字符数超出限制！\n\n当前字符数：' + text.length + '\n最大限制：' + CONFIG.MAX_CHARS + '\n\n请删减内容后重试。');
-                return;
-            }
-
-            // 检测不支持的字符，显示自定义确认对话框
+            // Detect unsupported characters, show the custom confirmation dialog
             if (checkUnsupportedChars(text)) {
                 $('#paste-confirm-dialog').show();
             } else {
-                // 没有不支持的字符，直接发送
+                // No unsupported characters, send directly
                 sendTextToVNC();
             }
         });
 
-        // 自定义确认对话框 - 确认发送
+        // Custom confirmation dialog - confirm send
         $('#paste-confirm-yes').click(function() {
             $('#paste-confirm-dialog').hide();
             sendTextToVNC();
         });
 
-        // 自定义确认对话框 - 取消
+        // Custom confirmation dialog - cancel
         $('#paste-confirm-no').click(function() {
             $('#paste-confirm-dialog').hide();
         });
 
-        // 取消按钮
+        // Cancel button
         $('#paste-cancel-btn').click(closeDialog);
         overlay.click(closeDialog);
 
         return { dialog, overlay, showDialog };
     }
 
-    // 在 noVNC 控制栏中添加按钮
+    // Add the button to the noVNC control bar
     function addPasteButton($) {
         const $controlBar = $('.noVNC_scroll');
 
         if ($controlBar.length === 0) {
-            console.error('未找到 noVNC 控制栏');
+            console.error('[PVE Paste Input] noVNC control bar not found');
             return;
         }
 
-        // 创建按钮（默认隐藏，等待同步逻辑决定是否显示）
+        // Create the button (hidden by default, waiting for the sync logic to decide whether to show it)
         const pasteButton = $(`
-            <input type="image" alt="粘贴输入"
+            <input type="image" alt="${T.buttonTitle}"
                    src="/novnc/app/images/clipboard.svg"
                    id="noVNC_paste_button"
                    class="noVNC_button noVNC_hidden"
-                   title="粘贴输入" />
+                   title="${T.buttonTitle}" />
         `);
 
-        // 将按钮插入到第一个位置
+        // Insert the button at the first position
         const $mobileButtons = $('#noVNC_mobile_buttons');
 
         if ($mobileButtons.length > 0) {
@@ -618,38 +1077,38 @@ const CONFIG = {
             }
         }
 
-        // 同步粘贴按钮与"显示额外按键"按钮的显示状态
+        // Sync the paste button's visibility with the "show extra keys" button
         function syncWithExtraKeysButton(pasteButton) {
-            let lastVisibleState = null;  // 缓存上次的可见状态，避免重复更新
-            let intersectionObserver = null;  // IntersectionObserver 实例
+            let lastVisibleState = null;  // Cache the last visible state to avoid redundant updates
+            let intersectionObserver = null;  // IntersectionObserver instance
 
-            // 更新按钮可见性（带状态缓存）
+            // Update button visibility (with state caching)
             const updateButtonVisibility = (isVisible) => {
-                // 状态未改变，跳过更新
+                // State unchanged, skip the update
                 if (lastVisibleState === isVisible) return;
 
                 lastVisibleState = isVisible;
 
                 if (isVisible) {
                     pasteButton.removeClass('noVNC_hidden');
-                    console.log('[PVE 粘贴输入] "显示额外按键"按钮可见 → 显示粘贴按钮');
+                    console.log('[PVE Paste Input] "Show extra keys" button visible -> showing paste button');
                 } else {
                     pasteButton.addClass('noVNC_hidden');
-                    console.log('[PVE 粘贴输入] "显示额外按键"按钮隐藏 → 隐藏粘贴按钮');
+                    console.log('[PVE Paste Input] "Show extra keys" button hidden -> hiding paste button');
                 }
             };
 
-            // 为找到的按钮设置 IntersectionObserver
+            // Set up an IntersectionObserver for the button once found
             const setupIntersectionObserver = (extraKeysButton) => {
-                // 如果已经存在 observer，先断开
+                // Disconnect any existing observer first
                 if (intersectionObserver) {
                     intersectionObserver.disconnect();
                 }
 
-                // 使用 IntersectionObserver 监听按钮的真实可见性
+                // Use IntersectionObserver to watch the button's real visibility
                 intersectionObserver = new IntersectionObserver((entries) => {
-                    // entries[0].isIntersecting 表示元素是否在视口中
-                    // 但我们需要检查元素是否真正可见（考虑 display:none 等）
+                    // entries[0].isIntersecting indicates whether the element is in the viewport
+                    // but we also need to check whether it's actually visible (e.g. display:none)
                     const entry = entries[0];
                     const isVisible = entry.isIntersecting &&
                                       entry.target.offsetParent !== null &&
@@ -657,35 +1116,35 @@ const CONFIG = {
 
                     updateButtonVisibility(isVisible);
                 }, {
-                    threshold: [0, 0.1]  // 监听元素进入和离开视口
+                    threshold: [0, 0.1]  // Watch for the element entering and leaving the viewport
                 });
 
                 intersectionObserver.observe(extraKeysButton);
-                console.log('[PVE 粘贴输入] 已设置 IntersectionObserver 监听"显示额外按键"按钮');
+                console.log('[PVE Paste Input] IntersectionObserver set up to watch "show extra keys" button');
 
-                // 立即检查一次初始状态
+                // Check the initial state immediately
                 const isVisible = extraKeysButton.offsetParent !== null &&
                                   extraKeysButton.offsetWidth > 0 &&
                                   extraKeysButton.offsetHeight > 0;
                 updateButtonVisibility(isVisible);
             };
 
-            // 尝试直接获取"显示额外按键"按钮
+            // Try to get the "show extra keys" button directly
             let extraKeysButton = document.getElementById('noVNC_toggle_extra_keys_button');
 
             if (extraKeysButton) {
-                // 按钮已存在，直接设置监听
-                console.log('[PVE 粘贴输入] 已找到"显示额外按键"按钮');
+                // Button already exists, set up the listener directly
+                console.log('[PVE Paste Input] Found "show extra keys" button');
                 setupIntersectionObserver(extraKeysButton);
             } else {
-                // 按钮不存在，使用 MutationObserver 等待按钮出现
-                console.log('[PVE 粘贴输入] 等待"显示额外按键"按钮加载...');
+                // Button doesn't exist yet, use a MutationObserver to wait for it
+                console.log('[PVE Paste Input] Waiting for "show extra keys" button to load...');
                 const domObserver = new MutationObserver(() => {
                     extraKeysButton = document.getElementById('noVNC_toggle_extra_keys_button');
                     if (extraKeysButton) {
-                        console.log('[PVE 粘贴输入] 已找到"显示额外按键"按钮（延迟加载）');
+                        console.log('[PVE Paste Input] Found "show extra keys" button (deferred load)');
                         setupIntersectionObserver(extraKeysButton);
-                        // 注意：不断开 domObserver，以便处理按钮重建的情况
+                        // Note: don't disconnect domObserver, so button re-creation is handled too
                     }
                 });
 
@@ -696,34 +1155,34 @@ const CONFIG = {
             }
         }
 
-        // 立即尝试同步（不延迟），确保按钮初始状态正确
+        // Sync immediately (no delay) to make sure the initial button state is correct
         syncWithExtraKeysButton(pasteButton);
 
-        console.log('粘贴输入按钮已添加到 noVNC 控制栏');
+        console.log('[PVE Paste Input] Paste button added to noVNC control bar');
         return pasteButton;
     }
 
-    // 初始化函数
+    // Initialize function
     function initialize($) {
-        // 等待 DOM 加载
+        // Wait for the DOM to load
         $(document).ready(function() {
             setTimeout(() => {
-                console.log("[PVE 粘贴输入] Nginx 注入版本已加载 (v1.0)");
+                console.log("[PVE Paste Input] Nginx-injected version loaded (v2.0)");
 
-                // 给 canvas 添加 ID
+                // Add an ID to the canvas
                 $("canvas").attr("id", "canvas-id");
 
-                // 创建对话框和按钮
+                // Create the dialog and the button
                 const { showDialog } = createPasteDialog($);
                 const pasteButton = addPasteButton($);
 
-                // 按钮点击事件：显示对话框
+                // Button click event: show the dialog
                 pasteButton.click(showDialog);
             }, CONFIG.DELAY.INIT);
         });
     }
 
-    // 主入口：加载 jQuery 后初始化
+    // Main entry point: initialize after jQuery loads
     if (isNoVNCPage()) {
         loadjQuery(initialize);
     }
