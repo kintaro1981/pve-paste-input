@@ -1,8 +1,14 @@
 // ==UserScript==
-// @name         PVE Paste Input
+// @name         PVE 粘贴输入工具
+// @name:zh-CN   PVE 粘贴输入工具
+// @name:en      PVE Paste Input
 // @namespace    https://github.com/cjpjxjx/pve-paste-input/
 // @version      2.0
-// @description  Improved PVE paste input tool with unsupported character detection, view-only mode syncing, and automatic Chinese/English UI switching
+// @description  针对 Proxmox VE noVNC 控制台的文本粘贴输入工具，支持不支持字符检测、仅查看模式同步，以及中英文界面自动切换
+// @description:zh-CN  针对 Proxmox VE noVNC 控制台的文本粘贴输入工具，支持不支持字符检测、仅查看模式同步，以及中英文界面自动切换
+// @description:en  Improved PVE paste input tool with unsupported character detection, view-only mode syncing, and automatic Chinese/English UI switching
+// @author       cjpjxjx
+// @license      MIT
 // @match        https://*:8006/*
 // @include      /^.*novnc.*/
 // @grant        none
