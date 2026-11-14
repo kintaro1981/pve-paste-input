@@ -265,6 +265,7 @@ const T = I18N[detectLanguage()]
     // characters - exactly mirroring a physical keyboard.
     // ============================================
     const XK_Shift_L = 0xffe1
+    const XK_AltGr = 0xfe03; // ISO_Level3_Shift
     const XK_Return = 0xff0d
     const XK_Tab = 0xff09
 
@@ -322,25 +323,114 @@ const T = I18N[detectLanguage()]
     }
 
     // Emit a single character through the RFB API
-    function emitCharRFB(rfb, ch) {
-        if (ch === '\n' || ch === '\r') { rfb.sendKey(XK_Return, 'Enter'); return }
-        if (ch === '\t') { rfb.sendKey(XK_Tab, 'Tab'); return }
 
-        // keysym for printable ASCII is just its code point; code drives the scancode
-        const keysym = ch.charCodeAt(0)
-        const code = getKeyName(ch)
-        const needsShift = /[A-Z!@#$%^&*()_+{}:"<>?~|]/.test(ch)
-
-        if (needsShift) {
-            rfb.sendKey(XK_Shift_L, 'ShiftLeft', true)
-            rfb.sendKey(keysym, code, true)
-            rfb.sendKey(keysym, code, false)
-            rfb.sendKey(XK_Shift_L, 'ShiftLeft', false)
-        } else {
-            rfb.sendKey(keysym, code, true)
-            rfb.sendKey(keysym, code, false)
-        }
+function emitCharRFB(rfb, ch) {
+    if (ch === '\n' || ch === '\r') {
+        rfb.sendKey(XK_Return, 'Enter');
+        return;
     }
+
+    if (ch === '\t') {
+        rfb.sendKey(XK_Tab, 'Tab');
+        return;
+    }
+
+    const map = {
+        '-': ['Slash'],
+        '_': ['Slash', true],
+        "'": ['Minus'],
+        '?': ['Minus', true],
+
+        '!': ['Digit1', true],
+        '"': ['Digit2', true],
+        '£': ['Digit3', true],
+        '$': ['Digit4', true],
+        '%': ['Digit5', true],
+        '&': ['Digit6', true],
+        '/': ['Digit7', true],
+        '(': ['Digit8', true],
+        ')': ['Digit9', true],
+        '=': ['Digit0', true],
+
+        '+': ['BracketRight'],
+        '*': ['BracketRight', true],
+
+        '@': ['Semicolon', false, true],
+        '#': ['Quote', false, true],
+
+        '[': ['BracketLeft', false, true],
+        ']': ['BracketRight', false, true],
+        '{': ['BracketLeft', true, true],
+        '}': ['BracketRight', true, true],
+
+        '\\': ['Backquote'],
+        '|': ['Backquote', true],
+
+        ',': ['Comma'],
+        ';': ['Comma', true],
+        '.': ['Period'],
+        ':': ['Period', true],
+
+        '<': ['IntlBackslash'],
+        '>': ['IntlBackslash', true],
+
+        '^': ['Equal', true],
+
+        // Italian accented characters
+        'à': ['Quote'],
+        'è': ['BracketLeft'],
+        'é': ['BracketLeft', true],
+        'ì': ['Equal'],
+        'ò': ['Semicolon'],
+        'ù': ['Backslash'],
+
+        // Additional Italian symbols
+        'ç': ['Semicolon', true],
+        '°': ['Quote', true],
+        '§': ['Backslash', true],
+        '€': ['KeyE', false, true]
+    };
+
+    let code;
+    let shift = false;
+    let altgr = false;
+
+    if (map[ch]) {
+        [code, shift = false, altgr = false] = map[ch];
+    } else if (/^[a-zA-Z]$/.test(ch)) {
+        code = 'Key' + ch.toUpperCase();
+        shift = ch !== ch.toLowerCase();
+    } else if (/^[0-9]$/.test(ch)) {
+        code = 'Digit' + ch;
+    } else if (ch === ' ') {
+        code = 'Space';
+    } else {
+        console.warn('[PVE Paste] Unsupported character:', ch);
+        return;
+    }
+
+    const keysym = ch.charCodeAt(0);
+
+    if (shift) {
+        rfb.sendKey(XK_Shift_L, 'ShiftLeft', true);
+    }
+
+    if (altgr) {
+        rfb.sendKey(XK_AltGr, 'AltRight', true);
+    }
+
+    rfb.sendKey(keysym, code, true);
+    rfb.sendKey(keysym, code, false);
+
+    if (altgr) {
+        rfb.sendKey(XK_AltGr, 'AltRight', false);
+    }
+
+    if (shift) {
+        rfb.sendKey(XK_Shift_L, 'ShiftLeft', false);
+    }
+}
+
 
     // Send a string to noVNC
     window.sendString = function(text, callbacks) {
